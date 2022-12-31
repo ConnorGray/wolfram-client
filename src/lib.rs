@@ -169,6 +169,11 @@ pub enum Packet {
 	///
 	/// [`MessagePacket`]: https://reference.wolfram.com/language/ref/MessagePacket
 	Message(Symbol, String),
+
+	/// [`SyntaxPacket`]
+	///
+	/// [`SyntaxPacket`]: https://reference.wolfram.com/language/ref/SyntaxPacket
+	Syntax(u64),
 }
 
 //======================================
@@ -362,7 +367,8 @@ impl<'k> Iterator for WolframSessionPackets<'k> {
 			| Packet::Return(_)
 			| Packet::Expression(_)
 			| Packet::Text(_)
-			| Packet::Message(_, _) => (),
+			| Packet::Message(_, _)
+			| Packet::Syntax(_) => (),
 			Packet::EnterExpression(_) | Packet::EnterText(_) => {
 				let err = WolframSessionError::UnexpectedPacket { packet };
 				panic!("{err}");
@@ -412,6 +418,15 @@ impl Packet {
 				"System`MessagePacket",
 				vec![Expr::symbol(symbol), Expr::string(name)],
 			),
+			Packet::Syntax(position) => {
+				let position: i64 = match i64::try_from(*position) {
+					Ok(value) => value,
+					Err(err) => panic!(
+						"u64 syntax position cannot be stored in i64: {err}"
+					),
+				};
+				("System`SyntaxPacket", vec![Expr::from(position)])
+			}
 		};
 
 		Expr::normal(Symbol::new(head), elements)
@@ -511,6 +526,21 @@ impl Packet {
 				};
 
 				Ok(Some(Packet::Message(symbol.clone(), name.clone())))
+			}
+			"System`SyntaxPacket" => {
+				let [position] = normal.elements() else {
+                    return expect_arg_count(1);
+                };
+
+				let ExprKind::Integer(position) = position.kind() else {
+                    return expect_arg_type(1, "Integer");
+                };
+
+				let Ok(position) = u64::try_from(*position) else {
+                    return expect_arg_type(1, "non-negative Integer");
+                };
+
+				Ok(Some(Packet::Syntax(position)))
 			}
 			_ => Ok(None),
 		}
