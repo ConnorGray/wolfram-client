@@ -23,6 +23,12 @@
 #[cfg(test)]
 mod tests;
 
+// Ensure that doc tests in the README.md file get run.
+#[doc(hidden)]
+mod test_readme {
+	#![doc = include_str!("../README.md")]
+}
+
 use std::path::Path;
 
 use wolfram_app_discovery::WolframApp;
