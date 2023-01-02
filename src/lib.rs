@@ -241,6 +241,10 @@ impl WolframSession {
 		})
 	}
 
+	/// Iterator over [`Packet`]s sent from the Kernel to the client.
+	///
+	/// Iterating over packets will automatically update
+	/// [`self.state()`][Self::state].
 	pub fn packets(&mut self) -> WolframSessionPackets {
 		WolframSessionPackets { kernel: self }
 	}
