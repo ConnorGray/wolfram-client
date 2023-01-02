@@ -81,8 +81,13 @@ pub enum WolframSessionState {
 
 	/// The Kernel is waiting for further input from the user.
 	///
-	/// Indicates that the Kernel sent an `InputNamePacket`.
-	WaitingForInput,
+	/// Indicates that the Kernel sent an [`InputNamePacket[string]`][InputNamePacket].
+	///
+	/// [InputNamePacket]: https://reference.wolfram.com/language/ref/InputNamePacket
+	WaitingForInput {
+		/// Input name specified in `InputNamePacket[string]`.
+		input_name: String,
+	},
 
 	/// An evaluation is being performed -- the client is waiting for output from
 	/// the Kernel.
@@ -273,7 +278,7 @@ impl WolframSession {
 		&mut self,
 		input: &str,
 	) -> Result<(), WolframSessionError> {
-		require_state_matches!(let WolframSessionState::WaitingForInput = self.state());
+		require_state_matches!(let WolframSessionState::WaitingForInput { .. } = self.state());
 
 		self.put_packet(Packet::EnterText(input.to_owned()))?;
 
@@ -362,8 +367,10 @@ impl<'k> Iterator for WolframSessionPackets<'k> {
 		};
 
 		match packet {
-			Packet::InputName(_) => {
-				kernel.state = WolframSessionState::WaitingForInput;
+			Packet::InputName(ref input_name) => {
+				kernel.state = WolframSessionState::WaitingForInput {
+					input_name: input_name.clone(),
+				};
 			}
 			Packet::ReturnExpression(_) | Packet::ReturnText(_) => {
 				require_state_matches!(let WolframSessionState::Evaluating = &kernel.state);
