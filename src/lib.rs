@@ -208,7 +208,7 @@ macro_rules! require_state_matches {
 }
 
 impl WolframSession {
-	/// Launch the default [`WolframKernel`] found on this computer.
+	/// Launch the default [`WolframKernel`] found on this computer. *(Blocking.)*
 	///
 	/// This method uses
 	/// [`wolfram-app-discovery`](https://crates.io/crates/wolfram-app-discovery)
@@ -225,7 +225,7 @@ impl WolframSession {
 	}
 
 	/// Start a new `WolframSession` by spawning a new [`WolframKernel`]
-	/// process.
+	/// process. *(Blocking.)*
 	///
 	/// [`WolframKernel`]: https://reference.wolfram.com/language/ref/program/WolframKernel
 	pub fn launch_kernel(
@@ -255,7 +255,11 @@ impl WolframSession {
 		state
 	}
 
-	/// Enter `input` to be evaluated by the Kernel.
+	//==================================
+	// Packet-oriented interface
+	//==================================
+
+	/// Enter `input` to be evaluated by the Kernel. *(Non-blocking.)*
 	///
 	/// This function sends [`Packet::EnterText`] to the Kernel.
 	///
@@ -268,7 +272,7 @@ impl WolframSession {
 			.expect("kernel session error during enter_text()")
 	}
 
-	/// Enter `input` to be evaluated by the Kernel.
+	/// Enter `input` to be evaluated by the Kernel. *(Non-blocking.)*
 	///
 	/// This function sends [`Packet::EnterText`] to the Kernel.
 	///
@@ -291,6 +295,7 @@ impl WolframSession {
 		Ok(())
 	}
 
+	/// *(Non-blocking.)*
 	pub fn put_packet(
 		&mut self,
 		packet: Packet,
@@ -302,6 +307,8 @@ impl WolframSession {
 			.link()
 			.put_expr(&packet_expr)
 			.map_err(|err| self.wstp_error(err))?;
+
+		// TODO: Call link().flush() here?
 
 		Ok(())
 	}
@@ -330,7 +337,7 @@ impl WolframSession {
 	// WSTP messages
 	//==================================
 
-	/// Send a WSTP urgent message to the Kernel.
+	/// Send a WSTP urgent message to the Kernel. *(Non-blocking.)*
 	///
 	/// # Examples
 	///
