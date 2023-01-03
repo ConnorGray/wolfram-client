@@ -8,6 +8,6 @@ edition = "2021"
 [dependencies]
 thiserror = "1.0.38"
 
-wstp = "0.2.4"
+wstp = "0.2.5"
 wolfram-expr = "0.1.3"
 wolfram-app-discovery = "0.4.0"
