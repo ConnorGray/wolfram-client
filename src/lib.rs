@@ -55,8 +55,20 @@ pub enum WolframSessionError {
 		"malformed packet expression is malformed: {message} (expr: {expr})"
 	)]
 	MalformedPacket { expr: Expr, message: String },
-	#[error("packet was not expected in the current state: {packet:?}")]
-	UnexpectedPacket { packet: Packet },
+	#[error(
+		"client does not support packet type sent from Kernel: {packet:?}"
+	)]
+	ClientUnsupportedPacket { packet: Packet },
+
+	#[error("expected MessagePacket[{symbol}, {name:?}] to be followed by output packet; got: {got:?}")]
+	ExpectedMessageContentPacket {
+		symbol: Symbol,
+		name: String,
+		got: Packet,
+	},
+
+	#[error("expected evaluation result to be followed by InputNamePacket[_]; got: {got:?}")]
+	ExpectedInputNamePacket { got: Packet },
 
 	#[error("the WSTP link used to communicate with the kernel yielded an unexpected error: {0}")]
 	WstpError(wstp::Error),
@@ -92,6 +104,10 @@ pub enum WolframSessionState {
 	/// An evaluation is being performed -- the client is waiting for output from
 	/// the Kernel.
 	Evaluating,
+
+	/// An evaluation finished, but the next `InputNamePacket[_]` hasn't been
+	/// received yet.
+	FinishedEvaluating,
 
 	/// The WSTP link connection to the Kernel died.
 	DeadLink,
@@ -188,6 +204,93 @@ pub enum Packet {
 }
 
 //======================================
+// Evaluation Outcome
+//======================================
+
+/// Data collected from the Kernel during a blocking evaluation.
+///
+/// This is returned by [`WolframSession::enter_and_wait()`].
+#[derive(Debug)]
+pub struct EvaluationData {
+	/// Output generated during the evaluation.
+	///
+	/// The output is stored in the order it was received from the Kernel.
+	pub output: Vec<Output>,
+
+	/// The outcome of the evaluation.
+	pub outcome: EvaluationOutcome,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum EvaluationOutcome {
+	/// The evaluation completed and returned a non-Null result.
+	Returned(PacketExpr),
+
+	/// The evaluation completed and yielded [`Null`], so no result was
+	/// returned to the client.
+	///
+	/// [`Null`]: https://reference.wolfram.com/language/ref/Null
+	Null,
+
+	/// The Kernel quit during the evaluation.
+	///
+	// TODO: Expectedly or unexpectedly; can we know? During or after the
+	//       evaluation completed?
+	KernelQuit,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum Output {
+	Print(PacketExpr),
+	Message(Message),
+}
+
+/// Representation of expression in [`Packet`]s.
+///
+/// **Input** — Expression sent from the client to the Kernel for evaluation.
+///
+/// **Printed** — Output intended for display to the user, typically sent by a
+///               [`Print`], [`Message`], or [`Echo`] during an evaluation.
+///
+/// [`Print`]: https://reference.wolfram.com/language/ref/Print
+/// [`Message`]: https://reference.wolfram.com/language/ref/Message
+/// [`Echo`]: https://reference.wolfram.com/language/ref/Echo
+#[derive(Debug, PartialEq)]
+pub enum PacketExpr {
+	/// Literal expression.
+	///
+	/// **Input:** [`Packet::EnterExpression`] or [`Packet::Evaluate`]
+	///
+	/// **Printed:** [`Packet::Expression`]
+	///
+	/// **Returned:** [`Packet::ReturnExpression`] or [`Packet::Return`]
+	Expr(Expr),
+	/// Textual expression representation.
+	///
+	/// This may validly be [`InputForm`] or [`OutputForm`] content, depending
+	/// on whether this content was part of a packet sent to or from the Kernel,
+	/// respectively.
+	///
+	/// **Input:** [`Packet::EnterText`]
+	///
+	/// **Printed:** [`Packet::Text`]
+	///
+	/// **Returned:** [`Packet::ReturnText`]
+	///
+	/// [`InputForm`]: https://reference.wolfram.com/language/ref/InputForm
+	/// [`OutputForm`]: https://reference.wolfram.com/language/ref/OutputForm
+	Text(String),
+}
+
+/// Message sent from the Kernel to the FrontEnd for display to the user.
+#[derive(Debug, PartialEq)]
+pub struct Message {
+	pub symbol: Symbol,
+	pub name: String,
+	pub content: PacketExpr,
+}
+
+//======================================
 // Impls
 //======================================
 
@@ -253,6 +356,221 @@ impl WolframSession {
 		let WolframSession { process: _, state } = self;
 
 		state
+	}
+
+	//==================================
+	// Blocking evaluation interface
+	//==================================
+
+	/// Perform an evaluation and wait until the result is returned. *(Blocking.)*
+	///
+	/// This function sends [`Packet::EnterExpression`] or
+	/// [`Packet::EnterText`] to the Kernel.
+	///
+	/// # Examples
+	///
+	/// Perform a computation and wait for the result:
+	///
+	/// ```
+	/// use wolfram_client::{WolframSession, Packet, PacketExpr};
+	///
+	/// let mut kernel = WolframSession::launch_default_kernel().unwrap();
+	///
+	/// let Packet::InputName(_) = kernel.packets().next().unwrap() else { panic!() };
+	///
+	/// let returned = kernel.enter_and_wait("2 + 2").outcome.unwrap_returned();
+	///
+	/// assert_eq!(returned, PacketExpr::Text("4".to_owned()));
+	/// ```
+	///
+	/// # Panics
+	///
+	/// This function panics if the underlying call to
+	/// [`try_enter_and_wait()`][Self::try_enter_and_wait] returns an error.
+	pub fn enter_and_wait<E: Into<PacketExpr>>(
+		&mut self,
+		input: E,
+	) -> EvaluationData {
+		let input: PacketExpr = input.into();
+		self.try_enter_and_wait(input)
+			.expect("error waiting for evaluation result of entered input")
+	}
+
+	/// Perform an evaluation and wait until the result is returned. *(Blocking.)*
+	///
+	/// # Errors
+	///
+	/// This function will return an error if:
+	///
+	/// * There is an error during the underlying call to [`put_packet()`][Self::put_packet]
+	/// * A WSTP error occurs.
+	///
+	pub fn try_enter_and_wait(
+		&mut self,
+		input: PacketExpr,
+	) -> Result<EvaluationData, WolframSessionError> {
+		require_state_matches!(
+			// Note: This can't be FinishedEvaluating because the next
+			// InputNamePacket[_] we receive has to mean the evaluation finished
+			// with a (possibly Null) result.
+			let WolframSessionState::WaitingForInput { .. } = self.state()
+		);
+
+		//
+		// Send `input` for evaluation
+		//
+
+		match input {
+			PacketExpr::Expr(expr) => {
+				self.put_packet(Packet::EnterExpression(expr))?
+			}
+			PacketExpr::Text(input) => {
+				self.put_packet(Packet::EnterText(input))?
+			}
+		}
+
+		self.state = WolframSessionState::Evaluating;
+
+		//
+		// Process packets sent back from the Kernel.
+		//
+
+		let mut output = Vec::new();
+
+		let outcome: EvaluationOutcome = loop {
+			let Some(packet) = self.packets().next() else {
+				debug_assert!(matches!(self.state, WolframSessionState::DeadLink));
+                break EvaluationOutcome::KernelQuit;
+            };
+
+			match packet {
+				// If the evaluation result is Null, no Return*Packet[..] is sent,
+				// and the next packet the client reads is an InputNamePacket[..].
+				Packet::InputName(_) => {
+					debug_assert!(matches!(
+						self.state,
+						WolframSessionState::WaitingForInput { .. }
+					));
+					break EvaluationOutcome::Null;
+				}
+				// Continue to the next iteration of the loop to return the
+				// Return*Packet[__].
+				Packet::OutputName(_) => (),
+				Packet::ReturnExpression(expr) => {
+					// TODO: What if this contains boxes?
+					break EvaluationOutcome::Returned(PacketExpr::Expr(expr));
+				}
+				Packet::ReturnText(text) => {
+					break EvaluationOutcome::Returned(PacketExpr::Text(text))
+				}
+				Packet::Return(expr) => {
+					break EvaluationOutcome::Returned(PacketExpr::Expr(expr))
+				}
+				// TODO: What if this contains boxes?
+				Packet::Expression(expr) => {
+					output.push(Output::Print(PacketExpr::Expr(expr)))
+				}
+				Packet::Text(text) => {
+					output.push(Output::Print(PacketExpr::Text(text)))
+				}
+				Packet::Message(symbol, name) => output.push(Output::Message(
+					self.get_message_content_packet(symbol, name)?,
+				)),
+				// TODO: Do something with syntax packets? SyntaxPacket[..]s
+				//       seem to always be preceded by MessagePacket[..]s, so
+				//       the syntax packet doesn't seem to add much.
+				Packet::Syntax(_) => (),
+				// TODO: Are there any reasons the Kernel might ask the client
+				//       to perform an evaluation. E.g. getting a FE value?
+				Packet::Evaluate(_)
+				| Packet::EnterExpression(_)
+				| Packet::EnterText(_) => {
+					return Err(WolframSessionError::ClientUnsupportedPacket {
+						packet,
+					})
+				}
+			}
+		};
+
+		match outcome {
+			EvaluationOutcome::Null => {
+				debug_assert!(matches!(
+					self.state,
+					WolframSessionState::WaitingForInput { .. }
+				))
+			}
+			EvaluationOutcome::Returned(_) => {
+				// Advance to read the next packet, which we expect to be
+				// InputNamePacket[_] or the Kernel quit.
+				match self.packets().next() {
+					Some(Packet::InputName(_)) => {
+						debug_assert!(matches!(
+							self.state,
+							WolframSessionState::WaitingForInput { .. }
+						))
+					}
+					Some(other) => {
+						return Err(
+							WolframSessionError::ExpectedInputNamePacket {
+								got: other,
+							},
+						)
+					}
+					None => {
+						debug_assert!(matches!(
+							self.state,
+							WolframSessionState::DeadLink
+						))
+					}
+				}
+			}
+			EvaluationOutcome::KernelQuit => {
+				debug_assert!(matches!(
+					self.state,
+					WolframSessionState::DeadLink
+				))
+			}
+		}
+
+		// Iterating over packets should have updated the state automatically.
+		debug_assert!(matches!(
+			self.state,
+			WolframSessionState::WaitingForInput { .. }
+				| WolframSessionState::DeadLink
+		));
+
+		Ok(EvaluationData { output, outcome })
+	}
+
+	/// A `MessagePacket` MUST be followed by a `TextPacket` or
+	/// `ExpressionPacket` containing the content of the message.
+	///
+	/// 1. `MessagePacket[..]`
+	/// 2. `TextPacket[..]` OR `ExpressionPacket[..]`
+	fn get_message_content_packet(
+		&mut self,
+		symbol: Symbol,
+		name: String,
+	) -> Result<Message, WolframSessionError> {
+		let message_content_packet = self.get_packet()?;
+
+		let content = match message_content_packet {
+			Packet::Text(text) => PacketExpr::Text(text),
+			Packet::Expression(expr) => PacketExpr::Expr(expr),
+			other => {
+				return Err(WolframSessionError::ExpectedMessageContentPacket {
+					symbol,
+					name,
+					got: other,
+				})
+			}
+		};
+
+		Ok(Message {
+			symbol,
+			name,
+			content,
+		})
 	}
 
 	//==================================
@@ -378,7 +696,11 @@ impl WolframSession {
 
 	fn wstp_error(&mut self, error: wstp::Error) -> WolframSessionError {
 		match error.code() {
-			Some(wstp::sys::WSEDEAD) => {
+			// TODO: Would it make sense to represent WSECLOSED and WSEDEAD with
+			//       different errors/states? Empirically, it seems that both
+			//       are observed even if the Kernel terminates gracefully due
+			//       to an evaluation of Exit[].
+			Some(wstp::sys::WSECLOSED | wstp::sys::WSEDEAD) => {
 				self.state = WolframSessionState::DeadLink;
 
 				WolframSessionError::DeadLink
@@ -415,6 +737,7 @@ impl<'k> Iterator for WolframSessionPackets<'k> {
 				if matches!(kernel.state, WolframSessionState::DeadLink) {
 					return None;
 				} else {
+					// TODO: Expose this error as part of the iterator
 					panic!("{err}")
 				}
 			}
@@ -427,7 +750,11 @@ impl<'k> Iterator for WolframSessionPackets<'k> {
 				};
 			}
 			Packet::ReturnExpression(_) | Packet::ReturnText(_) => {
-				require_state_matches!(let WolframSessionState::Evaluating = &kernel.state);
+				if cfg!(debug_assertions) {
+					require_state_matches!(let WolframSessionState::Evaluating = &kernel.state);
+				}
+
+				kernel.state = WolframSessionState::FinishedEvaluating;
 			}
 			Packet::Evaluate(_) => (),
 			Packet::OutputName(_)
@@ -436,8 +763,11 @@ impl<'k> Iterator for WolframSessionPackets<'k> {
 			| Packet::Text(_)
 			| Packet::Message(_, _)
 			| Packet::Syntax(_) => (),
+			// TODO: Don't generate an error here? Some clients might support
+			//       these packets?
 			Packet::EnterExpression(_) | Packet::EnterText(_) => {
-				let err = WolframSessionError::UnexpectedPacket { packet };
+				let err =
+					WolframSessionError::ClientUnsupportedPacket { packet };
 				panic!("{err}");
 			}
 		};
@@ -611,5 +941,61 @@ impl Packet {
 			}
 			_ => Ok(None),
 		}
+	}
+}
+
+//======================================
+// Evaluation results
+//======================================
+
+impl EvaluationOutcome {
+	/// Expect this evaluation to have returned a result.
+	///
+	/// If `self` is [`EvaluationOutcome::Returned(expr)`], then `expr` will be
+	/// returned.
+	///
+	/// Otherwise, this function will panic.
+	#[track_caller]
+	pub fn unwrap_returned(self) -> PacketExpr {
+		match self {
+            EvaluationOutcome::Returned(returned) => returned,
+			EvaluationOutcome::Null => panic!("unable to unwrap returned evaluation: evaluation result was Null"),
+            EvaluationOutcome::KernelQuit => panic!("unable to unwrap returned evaluation: Kernel quit during evaluation"),
+        }
+	}
+
+	/// Expect this evaluation to have resulted in [`Null`].
+	///
+	/// If `self` is [`EvaluationOutcome::Null`], then this function will return
+	/// normally.
+	///
+	/// Otherwise, this function will panic.
+	///
+	/// [`Null`]: https://reference.wolfram.com/language/ref/Null
+	#[track_caller]
+	pub fn unwrap_null(self) {
+		match self {
+            EvaluationOutcome::Returned(returned) => panic!("unable to unwrap null: evaluation returned a result: {returned:?}"),
+			EvaluationOutcome::Null => (),
+            EvaluationOutcome::KernelQuit => panic!("unable to unwrap returned evaluation: Kernel quit during evaluation"),
+        }
+	}
+}
+
+impl From<Expr> for PacketExpr {
+	fn from(expr: Expr) -> PacketExpr {
+		PacketExpr::Expr(expr)
+	}
+}
+
+impl<'s> From<&str> for PacketExpr {
+	fn from(input: &str) -> PacketExpr {
+		PacketExpr::Text(input.to_owned())
+	}
+}
+
+impl From<String> for PacketExpr {
+	fn from(input: String) -> PacketExpr {
+		PacketExpr::Text(input)
 	}
 }
