@@ -326,6 +326,49 @@ impl WolframSession {
 		Ok(packet)
 	}
 
+	//==================================
+	// WSTP messages
+	//==================================
+
+	/// Send a WSTP urgent message to the Kernel.
+	///
+	/// # Examples
+	///
+	/// Abort a long-running computation by sending
+	/// [`UrgentMessage::ABORT`][wstp::UrgentMessage::ABORT]
+	/// to the Kernel.
+	///
+	/// ```
+	/// use wstp::UrgentMessage;
+	/// use wolfram_client::{WolframSession, Packet};
+	/// use wolfram_expr::Symbol;
+	///
+	/// let mut kernel = WolframSession::launch_default_kernel().unwrap();
+	///
+	/// // In[1]:=
+	/// let Packet::InputName(_) = kernel.packets().next().unwrap() else { panic!() };
+	///
+	/// // Start a long-running computation.
+	/// kernel.enter_text("Pause[10]");
+	///
+	/// // Tell the Kernel to abort the current computation.
+	/// kernel.put_message(UrgentMessage::ABORT).unwrap();
+	///
+	/// // Out[1]=
+	/// let Packet::OutputName(_) = kernel.packets().next().unwrap() else { panic!() };
+	///
+	/// let Packet::ReturnExpression(result) = kernel.packets().next().unwrap() else { panic!() };
+	///
+	///	assert_eq!(result, Symbol::new("System`$Aborted"));
+	/// ```
+	pub fn put_message(
+		&mut self,
+		message: wstp::UrgentMessage,
+	) -> Result<(), wstp::Error> {
+		// TODO: Update `self.state` based on the message type?
+		self.process.link().put_message(message)
+	}
+
 	fn wstp_error(&mut self, error: wstp::Error) -> WolframSessionError {
 		match error.code() {
 			Some(wstp::sys::WSEDEAD) => {
