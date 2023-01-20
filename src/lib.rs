@@ -409,6 +409,76 @@ impl WolframSession {
 		&mut self,
 		input: PacketExpr,
 	) -> Result<EvaluationData, WolframSessionError> {
+		let mut output: Vec<Output> = Vec::new();
+
+		let outcome = self.try_enter_and_wait_with_output_handler(
+			input,
+			&mut |o: Output| output.push(o),
+		)?;
+
+		Ok(EvaluationData { output, outcome })
+	}
+
+	/// Perform an evaluation and wait until the result is returned, calling an
+	/// output handler on printed output. *(Blocking.)*
+	///
+	/// This function sends [`Packet::EnterExpression`] or
+	/// [`Packet::EnterText`] to the Kernel.
+	///
+	/// # Examples
+	///
+	/// Perform an evaluation, and immediately print any output as it is sent
+	/// from the Kernel:
+	///
+	/// ```
+	/// use wolfram_client::{WolframSession, Packet, Output, EvaluationOutcome};
+	///
+	/// let mut session = WolframSession::launch_default_kernel().unwrap();
+	///
+	/// // In[1]:=
+	/// let Packet::InputName(_) = session.packets().next().unwrap() else { panic!() };
+	///
+	/// // Start an evaluation that produces output as it progresses.
+	/// let outcome = session.enter_and_wait_with_output_handler(
+	/// 	"Do[Print[i], {i, 5}]",
+	/// 	&mut |output: Output| {
+	/// 		println!("{output:?}")
+	/// 	}
+	/// );
+	///
+	/// assert!(outcome == EvaluationOutcome::Null);
+	/// ```
+	///
+	/// # Panics
+	///
+	/// This function panics if the underlying call to
+	/// [`try_enter_and_wait_with_output_handler()`][Self::try_enter_and_wait_with_output_handler]
+	/// returns an error.
+	pub fn enter_and_wait_with_output_handler<E: Into<PacketExpr>>(
+		&mut self,
+		input: E,
+		handle_output: &mut dyn FnMut(Output),
+	) -> EvaluationOutcome {
+		let input: PacketExpr = input.into();
+		self.try_enter_and_wait_with_output_handler(input, handle_output)
+			.expect("error waiting for evaluation result of entered input")
+	}
+
+	/// Perform an evaluation and wait until the result is returned, calling an
+	/// output handler on printed output. *(Blocking.)*
+	///
+	/// # Errors
+	///
+	/// This function will return an error if:
+	///
+	/// * There is an error during the underlying call to [`put_packet()`][Self::put_packet]
+	/// * A WSTP error occurs.
+	///
+	pub fn try_enter_and_wait_with_output_handler(
+		&mut self,
+		input: PacketExpr,
+		handle_output: &mut dyn FnMut(Output),
+	) -> Result<EvaluationOutcome, WolframSessionError> {
 		require_state_matches!(
 			// Note: This can't be FinishedEvaluating because the next
 			// InputNamePacket[_] we receive has to mean the evaluation finished
@@ -434,8 +504,6 @@ impl WolframSession {
 		//
 		// Process packets sent back from the Kernel.
 		//
-
-		let mut output = Vec::new();
 
 		let outcome: EvaluationOutcome = loop {
 			let Some(packet) = self.packets().next() else {
@@ -468,14 +536,16 @@ impl WolframSession {
 				}
 				// TODO: What if this contains boxes?
 				Packet::Expression(expr) => {
-					output.push(Output::Print(PacketExpr::Expr(expr)))
+					handle_output(Output::Print(PacketExpr::Expr(expr)))
 				}
 				Packet::Text(text) => {
-					output.push(Output::Print(PacketExpr::Text(text)))
+					handle_output(Output::Print(PacketExpr::Text(text)))
 				}
-				Packet::Message(symbol, name) => output.push(Output::Message(
-					self.get_message_content_packet(symbol, name)?,
-				)),
+				Packet::Message(symbol, name) => {
+					handle_output(Output::Message(
+						self.get_message_content_packet(symbol, name)?,
+					))
+				}
 				// TODO: Do something with syntax packets? SyntaxPacket[..]s
 				//       seem to always be preceded by MessagePacket[..]s, so
 				//       the syntax packet doesn't seem to add much.
@@ -539,7 +609,7 @@ impl WolframSession {
 				| WolframSessionState::DeadLink
 		));
 
-		Ok(EvaluationData { output, outcome })
+		Ok(outcome)
 	}
 
 	/// A `MessagePacket` MUST be followed by a `TextPacket` or
