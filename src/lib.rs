@@ -344,6 +344,18 @@ impl WolframSession {
 		})
 	}
 
+	/// Access the underlying [`WolframKernelProcess`] being managed by this
+	/// [`WolframSession`] instance.
+	///
+	/// **Warning:** [`WolframSession`] internally maintains state based on
+	/// what packets have been sent to or recieved from the associated
+	/// WolframKernel process. Performing actions via this unmonitored handle to
+	/// the [`WolframKernelProcess`] may invalidate this [`WolframSession`]
+	/// instance.
+	pub fn process(&mut self) -> &mut WolframKernelProcess {
+		&mut self.process
+	}
+
 	/// Iterator over [`Packet`]s sent from the Kernel to the client.
 	///
 	/// Iterating over packets will automatically update
